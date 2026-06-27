@@ -162,12 +162,41 @@ Observe:
 
 ### 5.4. Demonstrar a deduplicação (Inbox)
 
-Republique a mesma mensagem (pelo Kafka UI, "produce message" copiando value + header
-`messageId`), ou reinicie o consumer com offset `earliest`. O log mostrará:
+> **Pré-requisito:** a infra (passo 5.1, `docker compose up -d`) e o `notification-service`
+> (passo 5.2) precisam estar no ar. O comando publica no container `iox-kafka`; se ele não
+> existir (`No such container: iox-kafka`), suba a infra primeiro.
+
+Publique a **mesma mensagem duas vezes** (mesmo header `messageId`) direto no tópico
+`orders.events`. O comando abaixo faz exatamente isso — copie e cole no terminal:
+
+```bash
+MSG_ID=11111111-1111-1111-1111-111111111111
+ORDER_ID=22222222-2222-2222-2222-222222222222
+LINE="messageId:$MSG_ID@$ORDER_ID#{\"orderId\":\"$ORDER_ID\",\"customer\":\"Dup\",\"amount\":10.00,\"createdAt\":\"2026-06-27T12:00:00Z\"}"
+printf '%s\n%s\n' "$LINE" "$LINE" | MSYS_NO_PATHCONV=1 docker exec -i iox-kafka /opt/kafka/bin/kafka-console-producer.sh \
+  --bootstrap-server localhost:9092 --topic orders.events \
+  --property parse.headers=true --property headers.delimiter=@ --property headers.key.separator=: \
+  --property parse.key=true --property key.separator='#'
+```
+
+> O formato de cada linha é `headers@key#value`: o header `messageId` (id de idempotência), a
+> chave Kafka (`orderId`) e o payload JSON do evento. As duas linhas são idênticas de propósito.
+>
+> O prefixo `MSYS_NO_PATHCONV=1` é necessário **só no Git Bash (Windows)**: sem ele, o MSYS
+> converte o caminho `/opt/kafka/...` para um caminho Windows e o Docker falha com
+> `exec: ".../opt/kafka/bin/kafka-console-producer.sh": no such file or directory`. Em
+> Linux/macOS/WSL o prefixo é inofensivo (pode mantê-lo ou removê-lo).
+
+No log do `notification-service`, a 1ª cópia é processada e a 2ª é ignorada como duplicata:
 
 ```
-Inbox: mensagem <uuid> já processada — ignorando duplicata
+c.m.n.application.NotificationService : Notificação enviada: pedido 22222222-... do cliente Dup no valor 10.00
+c.m.n.inbox.InboxService             : Inbox: mensagem 11111111-... já processada — ignorando duplicata
 ```
+
+> Como o `messageId` é fixo no comando, ao rodar de novo **ambas** as cópias aparecem como
+> duplicata (o id já está em `processed_messages`) — o que também comprova a idempotência.
+> Para um cenário "1 novo + 1 duplicata" a cada execução, troque os UUIDs (ex.: `uuidgen`).
 
 ### 5.5. Demonstrar retry + Dead Letter Topic
 
