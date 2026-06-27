@@ -1,0 +1,34 @@
+spring:
+  application:
+    name: order-service
+
+  datasource:
+    url: jdbc:postgresql://localhost:5432/orders_db
+    username: app
+    password: app
+
+  jpa:
+    hibernate:
+      # Flyway é a fonte da verdade do schema; Hibernate apenas valida o mapeamento.
+      ddl-auto: validate
+    open-in-view: false
+
+  flyway:
+    enabled: true
+
+  kafka:
+    bootstrap-servers: localhost:9092
+
+server:
+  port: 8081
+
+# Configuração do publisher do Outbox (polling).
+outbox:
+  publisher:
+    enabled: true        # mude para false ao demonstrar a alternativa CDC (Debezium)
+    poll-delay-ms: 1000  # intervalo entre ciclos de polling
+    batch-size: 100      # máximo de mensagens publicadas por ciclo
+
+logging:
+  level:
+    com.marcos.orderservice.outbox: INFO
