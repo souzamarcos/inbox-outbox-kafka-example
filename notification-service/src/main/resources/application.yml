@@ -1,0 +1,28 @@
+spring:
+  application:
+    name: notification-service
+
+  datasource:
+    url: jdbc:postgresql://localhost:5432/notifications_db
+    username: app
+    password: app
+
+  jpa:
+    hibernate:
+      ddl-auto: validate
+    open-in-view: false
+
+  flyway:
+    enabled: true
+
+  kafka:
+    bootstrap-servers: localhost:9092
+    consumer:
+      group-id: notification-service
+
+server:
+  port: 8082
+
+logging:
+  level:
+    com.marcos.notificationservice: INFO

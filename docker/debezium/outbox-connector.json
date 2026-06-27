@@ -1,0 +1,31 @@
+{
+  "name": "outbox-connector",
+  "config": {
+    "connector.class": "io.debezium.connector.postgresql.PostgresConnector",
+    "database.hostname": "postgres",
+    "database.port": "5432",
+    "database.user": "app",
+    "database.password": "app",
+    "database.dbname": "orders_db",
+    "topic.prefix": "iox",
+    "table.include.list": "public.outbox",
+    "plugin.name": "pgoutput",
+
+    "_comment_smt": "Outbox Event Router: transforma cada INSERT na tabela outbox em uma mensagem de evento, mapeando as colunas customizadas deste exemplo.",
+    "transforms": "outbox",
+    "transforms.outbox.type": "io.debezium.transforms.outbox.EventRouter",
+    "transforms.outbox.table.field.event.id": "message_id",
+    "transforms.outbox.table.field.event.key": "aggregate_id",
+    "transforms.outbox.table.field.event.type": "event_type",
+    "transforms.outbox.table.field.event.payload": "payload",
+
+    "_comment_topic": "Roteia tudo para o mesmo tópico que o publisher por polling usa.",
+    "transforms.outbox.route.topic.replacement": "orders.events",
+
+    "_comment_headers": "Propaga message_id e event_type como HEADERS Kafka, para o notification-service deduplicar exatamente como no modo polling.",
+    "transforms.outbox.table.fields.additional.placement": "message_id:header:messageId,event_type:header:eventType",
+
+    "key.converter": "org.apache.kafka.connect.storage.StringConverter",
+    "value.converter": "org.apache.kafka.connect.storage.StringConverter"
+  }
+}
