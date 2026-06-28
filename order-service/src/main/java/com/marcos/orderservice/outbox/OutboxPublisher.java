@@ -3,7 +3,9 @@ package com.marcos.orderservice.outbox;
 import com.marcos.events.Headers;
 import com.marcos.events.Topics;
 import java.nio.charset.StandardCharsets;
+import java.util.ArrayList;
 import java.util.List;
+import java.util.concurrent.CompletableFuture;
 import org.apache.kafka.clients.producer.ProducerRecord;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
@@ -53,22 +55,32 @@ public class OutboxPublisher {
             return;
         }
 
+        // Envia o lote inteiro "em voo" (sem join por mensagem) e só então espera todos os acks.
+        // Isso paraleliza os envios — o producer idempotente (enable.idempotence) cuida de duplicatas
+        // de retry — em vez de bloquear mensagem a mensagem. É o que destrava a vazão do publisher
+        // sob carga (ver seção de teste de carga no README): o gargalo era o join() serial, não o lote.
+        List<CompletableFuture<?>> acks = new ArrayList<>(batch.size());
         for (OutboxMessage message : batch) {
-            publish(message);
+            acks.add(send(message));
+        }
+
+        // Barreira única: só seguimos quando TODAS as mensagens foram confirmadas (acks=all). Se
+        // qualquer uma falhar, o join lança, a transação aborta e NENHUMA linha vira SENT (republica
+        // no próximo ciclo). Mantém a garantia "marca SENT apenas após o broker confirmar".
+        CompletableFuture.allOf(acks.toArray(new CompletableFuture[0])).join();
+
+        for (OutboxMessage message : batch) {
             message.markSent();
         }
         log.info("Outbox: publicadas {} mensagem(ns) no tópico {}", batch.size(), Topics.ORDER_EVENTS);
     }
 
-    private void publish(OutboxMessage message) {
+    private CompletableFuture<?> send(OutboxMessage message) {
         // Chave = aggregateId (id do pedido): garante ordenação por pedido dentro da partição.
         ProducerRecord<String, String> record =
                 new ProducerRecord<>(Topics.ORDER_EVENTS, message.getAggregateId(), message.getPayload());
         record.headers().add(Headers.MESSAGE_ID, message.getMessageId().toString().getBytes(StandardCharsets.UTF_8));
         record.headers().add(Headers.EVENT_TYPE, message.getEventType().getBytes(StandardCharsets.UTF_8));
-
-        // .join() torna a publicação síncrona dentro do laço: só marcamos SENT após o broker
-        // confirmar (acks=all). Se falhar, a exceção aborta a transação e nada vira SENT.
-        kafkaTemplate.send(record).join();
+        return kafkaTemplate.send(record);
     }
 }

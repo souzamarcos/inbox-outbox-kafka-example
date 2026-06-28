@@ -26,13 +26,19 @@ public class ProcessedMessage {
     @Column(name = "processed_at", nullable = false)
     private Instant processedAt;
 
+    // Momento em que o pedido foi criado no order-service (vem do payload do evento). Usado só
+    // para medir a latência ponta-a-ponta (processed_at − event_created_at) no teste de carga.
+    @Column(name = "event_created_at")
+    private Instant eventCreatedAt;
+
     protected ProcessedMessage() {
         // exigido pelo JPA
     }
 
-    public ProcessedMessage(UUID messageId) {
+    public ProcessedMessage(UUID messageId, Instant eventCreatedAt) {
         this.messageId = messageId;
         this.processedAt = Instant.now();
+        this.eventCreatedAt = eventCreatedAt;
     }
 
     public UUID getMessageId() {
@@ -41,5 +47,9 @@ public class ProcessedMessage {
 
     public Instant getProcessedAt() {
         return processedAt;
+    }
+
+    public Instant getEventCreatedAt() {
+        return eventCreatedAt;
     }
 }

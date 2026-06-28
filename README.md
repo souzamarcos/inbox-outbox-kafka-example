@@ -113,7 +113,8 @@ inbox-outbox-example/
 ├── order-service/   (OUTBOX)   REST + JPA + tabela outbox + OutboxPublisher (polling)
 ├── notification-service/ (INBOX) @KafkaListener + tabela processed_messages + retry/DLT
 ├── docker-compose.yml          Kafka (KRaft) + Postgres (2 DBs) + Kafka UI; profile "cdc": Debezium
-└── docker/                     init.sql (cria os DBs) e outbox-connector.json (CDC)
+├── docker/                     init.sql (cria os DBs) e outbox-connector.json (CDC)
+└── loadtest/                   teste de carga Scheduled × CDC: burst.js (k6) + latency.sql
 ```
 
 Arquivos-chave para ler nesta ordem:
@@ -283,7 +284,187 @@ headers — então o `notification-service` deduplica exatamente como no modo po
 
 ---
 
-## 9. Stack
+## 9. Teste de carga: Scheduled × CDC
+
+Cenário **burst (rajada)** para comparar, com números, os dois mecanismos de publicação do Outbox:
+o publisher por **polling** (`@Scheduled`) e o **CDC** (Debezium). A ideia é injetar muitos pedidos
+de uma vez (enchendo a `outbox`) e medir quanto tempo cada mecanismo leva para **drenar** a rajada e
+qual a **latência ponta a ponta** (criação do pedido → evento processado pelo consumer).
+
+### 9.1. Por que medir no consumer (e não no HTTP)
+
+O `POST /orders` é **idêntico** nos dois modos — ele só grava `orders` + `outbox(PENDING)` e retorna
+`201`. A publicação é assíncrona e desacoplada, então a latência do HTTP **não** distingue polling de
+CDC. O que distingue é o caminho **banco → Kafka → consumer**. Por isso a medição é feita no
+`notification-service`: a coluna `processed_messages.event_created_at` (migration `V2`) guarda o
+`createdAt` do evento, e a latência sai direto em SQL como `processed_at − event_created_at` — a mesma
+métrica vale para os dois modos.
+
+### 9.2. Pré-requisitos
+
+- Infra no ar (passo 5.1) e as duas apps (passo 5.2).
+- A carga é gerada com a imagem oficial do **k6** (não precisa instalar nada no host), via Docker.
+- Artefatos em `loadtest/`: `burst.js` (script k6) e `latency.sql` (métricas).
+
+### 9.3. Rodar o cenário (para cada modo)
+
+**1) Limpe as tabelas** (slate limpo entre execuções):
+
+```bash
+docker exec iox-postgres psql -U app -d orders_db        -c "TRUNCATE outbox, orders;"
+docker exec iox-postgres psql -U app -d notifications_db -c "TRUNCATE processed_messages;"
+```
+
+**2) Dispare a rajada** (5000 pedidos, 50 workers em paralelo):
+
+```bash
+# Linux: use --network host e localhost
+docker run --rm --network host \
+  -e TARGET=http://localhost:8081 -e TOTAL=5000 -e VUS=50 \
+  -v "$PWD/loadtest:/scripts" grafana/k6 run /scripts/burst.js
+
+# Docker Desktop (Windows/Mac): troque o alvo para host.docker.internal
+docker run --rm \
+  -e TARGET=http://host.docker.internal:8081 -e TOTAL=5000 -e VUS=50 \
+  -v "$PWD/loadtest:/scripts" grafana/k6 run /scripts/burst.js
+```
+
+**3) Acompanhe a drenagem** (quando `processed` chega a 5000, terminou):
+
+```bash
+docker exec iox-postgres psql -U app -d notifications_db \
+  -c "SELECT count(*) FROM processed_messages WHERE event_created_at IS NOT NULL;"
+```
+
+**4) Colete as métricas:**
+
+```bash
+docker exec -i iox-postgres psql -U app -d notifications_db -f - < loadtest/latency.sql
+```
+
+Para o modo **polling**, rode com a app padrão (`outbox.publisher.enabled=true`). Para o modo **CDC**,
+suba o `order-service` com `--outbox.publisher.enabled=false`, suba o profile `cdc` e registre o
+connector (seção 7). No CDC a app **não marca `SENT`** — as linhas ficam `PENDING` na `outbox` (a
+publicação acontece fora da app); a medição de drenagem é sempre no consumer.
+
+**Escalando o consumer (partições × concorrência).** A vazão do consumer só cresce se houver
+**partições** no tópico **e** threads para consumi-las. Suba o `notification-service` com a
+concorrência casada ao número de partições e ajuste o tópico antes (com o consumer parado, pois um
+consumer ativo recria o tópico via auto-create):
+
+```bash
+# nº de partições (use --alter para aumentar; só cresce)
+docker exec iox-kafka /opt/kafka/bin/kafka-topics.sh --bootstrap-server localhost:9092 \
+  --alter --topic orders.events --partitions 5
+
+# concorrência do consumer = nº de partições
+java -jar notification-service/build/libs/notification-service-0.0.1-SNAPSHOT.jar \
+  --app.consumer.concurrency=5
+```
+
+**Publisher de alto volume (polling).** Para o publisher acompanhar uma rajada grande, suba o lote e
+reduza o intervalo (o `OutboxPublisher` envia o lote em voo e dá `join` único no fim — ver 9.4):
+
+```bash
+java -jar order-service/build/libs/order-service-0.0.1-SNAPSHOT.jar \
+  --outbox.publisher.batch-size=1000 --outbox.publisher.poll-delay-ms=100
+```
+
+### 9.4. Relatório — números obtidos
+
+Medições reais nesta máquina (**6 cores**, ~7,7 GB para o Docker; single-node local, apps no host +
+infra em Docker). São **números relativos**, não capacidade absoluta. Rajada de **5000–6000 pedidos**
+por execução, injeção HTTP de ~600–840 req/s (k6, 100% `201`).
+
+**(a) O gargalo do publisher e a otimização para lote assíncrono.**
+Com a config **default** (`batch-size=100`, `poll-delay-ms=1000`) o polling drena ~**50 msg/s** —
+limitado pelo ciclo (lote pequeno + 1 s de espera). Tentar subir só a config esbarrou num teto de
+~**120 msg/s**: o gargalo **não era o tamanho do lote**, e sim o `kafkaTemplate.send().join()`
+**síncrono por mensagem** (esperava o `ack` uma a uma). Por isso o `OutboxPublisher` foi otimizado
+para **enviar o lote inteiro em voo e dar `join` uma vez só no fim** (mantendo a garantia
+"marca `SENT` apenas após o `ack`" — junta todos os *futures* antes de commitar). Efeito na vazão
+**crua do publisher → Kafka**:
+
+| Publisher | Vazão publisher→Kafka |
+|---|---:|
+| Default (`batch 100` / `delay 1000`) | ~50 msg/s |
+| Tunado **síncrono** (`batch 1000` / `delay 100`) | ~120 msg/s (teto do `.join()` serial) |
+| Tunado **assíncrono** (lote, `join` no fim) | ~**380–560 msg/s** |
+
+Com o publisher assíncrono (~380–560 msg/s) o gargalo **deixa de ser a publicação** e passa para o
+consumer/CPU — então o polling vira **consumer-bound**, igual ao CDC.
+
+**(b) Varredura de partições** (publisher assíncrono `batch 1000`/`delay 100`; consumer com
+`concurrency` = nº de partições; medição **ponta a ponta** `created → processed`):
+
+| Partições / `concurrency` | Scheduled async — throughput | Scheduled — p50 | CDC — throughput | CDC — p50 |
+|---:|---:|---:|---:|---:|
+| 1 | 171 msg/s | 15,4 s | 207 msg/s | 13,0 s |
+| 2 | 181 msg/s | 15,4 s | 216 msg/s | 12,6 s |
+| 5 | 209 msg/s | 13,0 s | 186 msg/s | 14,4 s |
+| 10 | **244 msg/s** | 5,5 s | 212 msg/s | 12,9 s |
+
+### 9.5. Mapa de limites — e por que 1000 msg/s não sai daqui
+
+**Scheduled (publisher assíncrono) — agora consumer-bound, escala fraco com threads.**
+Com a publicação destravada (~380–560 msg/s), o end-to-end passa a depender do consumer: sobe de
+**171 → 244 msg/s** (~**1,4×**) de 1 para 10 threads/partições. O ganho é **sublinear** porque os
+6 cores são disputados por Kafka + Postgres + as duas apps. Resumo da evolução do polling:
+default ~50 → tunado síncrono ~120 → **assíncrono ~170–244** msg/s.
+
+**CDC (Debezium) — ~flat em ~205 msg/s.**
+Fica em **186–216 msg/s** para 1, 2, 5 ou 10 partições (a variação é ruído). Adicionar threads no
+consumer **não ajuda** — mas, ao contrário do que parece, o gargalo **não é a publicação do
+Debezium**: medido isolado (consumer parado) ele captura ~**535 msg/s** (ver 9.6). O teto de ~205/s é
+**contenção de CPU** quando captura + consumo + Kafka + Postgres dividem os 6 cores.
+
+**Resposta direta: dá pra chegar a 1000 msg/s ponta a ponta aumentando o número de threads?**
+**Não nesta máquina.** As duas implementações saturam em ~**200–240 msg/s** e mais threads rendem só
+~1,4× (consumer) antes de a CPU dos 6 cores virar o teto. Para ~1000 msg/s o caminho **não é mais
+threads no mesmo host**, e sim **escalar horizontalmente**: tópico particionado + **N instâncias** do
+`notification-service` (consumer) — e, no polling, **N instâncias** do publisher (o
+`FOR UPDATE SKIP LOCKED` paraleliza com segurança) — distribuídas em **mais cores/máquinas**. O
+experimento mostra onde cada uma satura: o polling **deixou de saturar na publicação** (após o lote
+assíncrono) e ambos passam a saturar no **consumo/CPU**.
+
+> Reproduza variando `-e TOTAL=`/`-e VUS=` no k6, `--outbox.publisher.batch-size`/`--…poll-delay-ms`
+> (publisher) e partições/`--app.consumer.concurrency` (consumer) para ver os limites se moverem.
+
+### 9.6. Dá para escalar o Debezium para capturar mais?
+
+Um conector Debezium para Postgres roda como **uma única task** (o `tasks.max` é ignorado: o slot de
+replicação lógica é consumido serialmente). Não dá para paralelizar a captura de um mesmo slot/tabela.
+Resta **tunar a task única** e **dar mais recursos** — foi o que medimos.
+
+Tuning aplicado (em `loadtest/outbox-connector-tuned.json`): `max.batch.size=8192`,
+`max.queue.size=32768`, `poll.interval.ms=100`, e producer overrides `compression.type=lz4`,
+`linger.ms=20`, `batch.size=131072`. (Heap do `connect` já era `-Xmx2G`, não estava heap-bound.)
+
+**Vazão de captura isolada** (consumer parado, só Debezium → Kafka):
+
+| Conector | Captura (publish→Kafka) |
+|---|---:|
+| Baseline (sem tuning) | ~**545 msg/s** |
+| Tunado (batching + producer overrides) | ~526 msg/s |
+
+**End-to-end** com o conector tunado: **206 / 206 / 206 / 186 msg/s** para 1 / 2 / 5 / 10 partições —
+**idêntico** ao baseline (seção 9.4).
+
+**Conclusões:**
+- A task única captura ~**535 msg/s** isolada — **~2,6× o end-to-end** (~205/s). Logo, o gargalo
+  end-to-end **não é a publicação do Debezium**, é a **CPU** disputada por captura + consumo + Kafka +
+  Postgres nos 6 cores.
+- **O tuning do conector não moveu nada** (captura ~535 e end-to-end ~205 iguais): a captura é limitada
+  pelo **trabalho por evento** (decodificar o WAL + SMT EventRouter), não pela eficiência do producer;
+  o heap já era 2 GB; os cores são fixos.
+- Para o Debezium "processar mais" de verdade os únicos caminhos são: **(a)** mais cores/máquinas
+  (separar `connect`, consumer e infra), ou **(b)** **shardar a fonte** — `outbox` particionada no
+  Postgres com **um conector por partição** (cada um com seu slot), o que multiplica a captura ao custo
+  de **perder a ordem global** e mais complexidade.
+
+---
+
+## 10. Stack
 
 Java 25 · Spring Boot 4.1 · Spring for Apache Kafka 4.1 · Spring Data JPA · Flyway ·
-PostgreSQL 16 · Apache Kafka (KRaft) · Testcontainers 2 · Gradle (Kotlin DSL).
+PostgreSQL 16 · Apache Kafka (KRaft) · Testcontainers 2 · Gradle (Kotlin DSL) · k6 (teste de carga).

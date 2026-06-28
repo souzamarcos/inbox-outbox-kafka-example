@@ -46,7 +46,8 @@ public class InboxService {
         // Efeito de negócio primeiro: se lançar, a transação é desfeita e a mensagem é reprocessada.
         notificationService.handle(event);
 
-        // Marca como processada na MESMA transação do efeito de negócio.
-        processedMessages.save(new ProcessedMessage(messageId));
+        // Marca como processada na MESMA transação do efeito de negócio. Guarda também o
+        // createdAt do evento para permitir medir a latência ponta-a-ponta no teste de carga.
+        processedMessages.save(new ProcessedMessage(messageId, event.createdAt()));
     }
 }
