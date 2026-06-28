@@ -19,7 +19,10 @@
     "transforms.outbox.table.field.event.type": "event_type",
     "transforms.outbox.table.field.event.payload": "payload",
 
-    "_comment_topic": "Roteia tudo para o mesmo tópico que o publisher por polling usa.",
+    "_comment_route": "A SMT lê route.by.field para rotear; default é 'aggregatetype'. Aqui apontamos para a coluna real 'aggregate_type' (com underscore), senão a task falha com 'aggregatetype is not a valid field name'.",
+    "transforms.outbox.route.by.field": "aggregate_type",
+
+    "_comment_topic": "Ignora o valor de route.by.field e envia tudo para o mesmo tópico que o publisher por polling usa.",
     "transforms.outbox.route.topic.replacement": "orders.events",
 
     "_comment_headers": "Propaga message_id e event_type como HEADERS Kafka, para o notification-service deduplicar exatamente como no modo polling.",
