@@ -23,6 +23,12 @@ spring:
 server:
   port: 8082
 
+# Concorrência do consumer (nº de threads). Para escalar a vazão, suba junto com o número de
+# partições do tópico orders.events. Default 1 (uma thread, ordenação total por partição única).
+app:
+  consumer:
+    concurrency: 1
+
 logging:
   level:
     com.marcos.notificationservice: INFO

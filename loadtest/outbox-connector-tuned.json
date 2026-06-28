@@ -1,0 +1,35 @@
+{
+  "name": "outbox-connector",
+  "config": {
+    "connector.class": "io.debezium.connector.postgresql.PostgresConnector",
+    "database.hostname": "postgres",
+    "database.port": "5432",
+    "database.user": "app",
+    "database.password": "app",
+    "database.dbname": "orders_db",
+    "topic.prefix": "iox",
+    "table.include.list": "public.outbox",
+    "plugin.name": "pgoutput",
+
+    "transforms": "outbox",
+    "transforms.outbox.type": "io.debezium.transforms.outbox.EventRouter",
+    "transforms.outbox.table.field.event.id": "message_id",
+    "transforms.outbox.table.field.event.key": "aggregate_id",
+    "transforms.outbox.table.field.event.type": "event_type",
+    "transforms.outbox.table.field.event.payload": "payload",
+    "transforms.outbox.route.by.field": "aggregate_type",
+    "transforms.outbox.route.topic.replacement": "orders.events",
+    "transforms.outbox.table.fields.additional.placement": "message_id:header:messageId,event_type:header:eventType",
+
+    "key.converter": "org.apache.kafka.connect.storage.StringConverter",
+    "value.converter": "org.apache.kafka.connect.storage.StringConverter",
+
+    "_comment_tuning": "Tuning de vazão da task única (experimento A do README). max.batch/queue.size aumentam o lote que o Debezium lê do WAL por ciclo; poll.interval.ms menor reduz a espera por novos eventos; os producer.override.* deixam o envio ao Kafka mais eficiente (compressão lz4, linger acumula mais por request, batch.size maior).",
+    "max.batch.size": "8192",
+    "max.queue.size": "32768",
+    "poll.interval.ms": "100",
+    "producer.override.compression.type": "lz4",
+    "producer.override.linger.ms": "20",
+    "producer.override.batch.size": "131072"
+  }
+}

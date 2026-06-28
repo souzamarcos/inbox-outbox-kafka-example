@@ -40,6 +40,12 @@ public class KafkaConsumerConfig {
     @Value("${spring.kafka.bootstrap-servers}")
     private String bootstrapServers;
 
+    // Número de threads consumidoras (containers) do listener. Para escalar a vazão do consumer,
+    // suba este valor junto com o número de partições do tópico — cada thread assume um subconjunto
+    // das partições e processa em paralelo. Acima do nº de partições as threads extras ficam ociosas.
+    @Value("${app.consumer.concurrency:1}")
+    private int consumerConcurrency;
+
     @Bean
     public ConsumerFactory<String, String> consumerFactory() {
         Map<String, Object> props = new HashMap<>();
@@ -88,6 +94,8 @@ public class KafkaConsumerConfig {
                 new ConcurrentKafkaListenerContainerFactory<>();
         factory.setConsumerFactory(consumerFactory);
         factory.setCommonErrorHandler(errorHandler);
+        // Paraleliza o consumo: 'consumerConcurrency' threads, cada uma com partições próprias.
+        factory.setConcurrency(consumerConcurrency);
         return factory;
     }
 }
